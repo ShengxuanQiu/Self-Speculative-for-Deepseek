@@ -1,7 +1,4 @@
 import torch
-from modeling_llama import LlamaForCausalLM
-from transformers import AutoTokenizer
-from datasets import load_dataset
 from decoding import infer
 import json
 
@@ -21,6 +18,7 @@ class LayerSkippingSearching:
         self.config = model.config
         self.evaluate_prompts = evaluate_prompts
         self.evaluate_config = evaluate_config
+        self._eval_count = 0
 
         self.pbounds = {
             f"x{i}": (0, 1) for i in range(self.config.num_hidden_layers * 2)
@@ -33,6 +31,7 @@ class LayerSkippingSearching:
         self.optimizer.set_gp_params(alpha=1e-2)
 
     def _black_box_evaluate_function(self, **kargs):
+        self._eval_count += 1
         attn_skip_layers = []
         for i in range(self.config.num_hidden_layers):
             if kargs[f"x{i}"] > 0.5:
@@ -58,7 +57,7 @@ class LayerSkippingSearching:
             total_tokens += self.evaluate_config.get("max_new_tokens", 10)
 
         print(
-            "Log:",
+            f"[Eval {self._eval_count}]",
             total_tokens / total_time,
             "tokens/s",
             "Skipped attn:",

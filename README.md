@@ -7,54 +7,27 @@
 </div>
 Code associated with the paper:
 
-**[ACL 2024] [Draft &amp; Verify: Lossless Large Language Model Acceleration via Self-Speculative Decoding](https://arxiv.org/abs/2309.08168)**
-
-![Overview](./assets/intro.png)
-
-Self-Speculative Decoding is a novel inference scheme for accelerating Large Language Models (LLMs) without additional neural network training and extra memory footprint. It not only maintains consistent output quality but also ensures model compatibility, making it a *plug-and-play* and *cost-effective* solution for LLM inference acceleration.
-
-Self-Speculative Decoding involves a two-stage process:
-
-**Drafting stage:** Generates draft tokens by selectively skipping certain intermediate layers.
-
-**Verification stage:** Employs the original LLM to validate draft tokens in one forward pass.
-
-## Cite Our Paper
-
-If you find this code and paper useful in your research, please consider citing:
-
-```
-@article{zhang2023draft,
-      title={Draft & Verify: Lossless Large Language Model Acceleration via Self-Speculative Decoding}, 
-      author={Jun Zhang, Jue Wang, Huan Li, Lidan Shou, Ke Chen, Gang Chen, Sharad Mehrotra},
-      year={2023},
-      eprint={2309.08168},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL}
-}
-```
-
-## Requirements
-
-- PyTorch
-- Transformer
-- NumPy
-- More in ssd.yml
-
-## Files
-
-- searching.py: Selection of skipped layers by Bayesian optmization
-- decoding.py: Core process of self-speculative decoding
-- modeling_llama.py: Model structure with self-speculative decoding
-- search.ipynb: Main script searches for skipped layers
-- evaluate_sum.ipynb: Main script evaluates self-speculative decoding on text generation task
-- evaluate_code.ipynb: Main script evaluates self-speculative decoding on code generation task
-- skip_layers.json: Layers skipped by draft models corresponding to different base models
-- ssd.yml: Relevant environment
 
 ## Usage
 
-1. Configure the relevant environment according to ssd.yml;
-2. Execute search.ipynb to get skipped layers to generate a draft model;
-3. Execute evaluate_sum.ipynb to evaluate self-speculative decoding on summarization;
-4. Execute evaluate_code.ipynb to evaluate self-speculative decoding on code generation.
+1. Configure the environment according to `ssd.yml` (PyTorch, transformers, bayesian-optimization, safetensors, etc.).
+2. (LLaMA family) Use `search.ipynb` to search skipped layers and `evaluate_*` notebooks for evaluation.
+3. (DeepSeek V2 Lite Chat) Use the provided script to search skipped layers on a local prompt set:
+
+   - Prepare `question.jsonl` in repo root (already included; uses `turns` field as prompts).
+   - Load model weights under `model_name` (default `/data/pretrained_models/DeepSeek-V2-Lite-Chat`).
+   - Run:
+     ```bash
+     # optional: limit GPUs
+     export CUDA_VISIBLE_DEVICES=0,1,2,3
+     python search_deepseek.py
+     ```
+   - The script will:
+     - load tokenizer/model with `device_map="auto"` (multi-GPU/CPU as needed);
+     - build prompts from `question.jsonl`;
+     - run Bayesian optimization over skip-layer combinations (default `n_iter=200`, generate_fn `essg`, `max_new_tokens=32`);
+     - print per-eval throughput and save the best skip sets to `skip_layers.json` under key `deepseek-v2-lite-chat`.
+
+Notes:
+- If you want faster trials, reduce `n_iter`, truncate prompts, or lower `max_new_tokens`.
+- Current `essg` run disables KV cache for stability; throughput numbers are for this setting.

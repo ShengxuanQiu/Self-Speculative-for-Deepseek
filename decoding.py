@@ -2,7 +2,39 @@
 import torch
 import torch.nn as nn
 import time
-from transformers import top_k_top_p_filtering
+
+# top_k_top_p_filtering compatibility across transformers versions
+try:
+    from transformers import top_k_top_p_filtering  # type: ignore
+except Exception:
+    try:
+        from transformers.generation.utils import top_k_top_p_filtering  # type: ignore
+    except Exception:
+        # Minimal reimplementation (copied from older Transformers) for local use.
+        import torch.nn.functional as F
+
+        def top_k_top_p_filtering(
+            logits: torch.Tensor,
+            top_k: int = 0,
+            top_p: float = 1.0,
+            filter_value: float = -float("Inf"),
+            min_tokens_to_keep: int = 1,
+        ) -> torch.Tensor:
+            """Filter a distribution of logits using top-k and/or nucleus (top-p) filtering."""
+            if top_k > 0:
+                top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                logits = logits.masked_fill(indices_to_remove, filter_value)
+            if 0.0 < top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., :min_tokens_to_keep] = 0
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits = logits.masked_fill(indices_to_remove, filter_value)
+            return logits
 
 
 def sample(logits, return_probs: bool=False, do_sample: bool=False, top_k: int=50, top_p: float=0.7, temperature: float=0.7):
@@ -33,8 +65,9 @@ def base_generate(model, tokenizer, input_ids, max_new_tokens=10,
                   do_sample=False, top_k=0, top_p=0.85, temperature=0.2,
                   early_stop=False):
 
+    device = getattr(model, "device", next(model.parameters()).device)
     current_input_ids = input_ids
-    generate_ids = torch.empty([input_ids.size(0), max_new_tokens], dtype=torch.long, device=model.device)
+    generate_ids = torch.empty([input_ids.size(0), max_new_tokens], dtype=torch.long, device=device)
     past_key_values = None
     
     with torch.no_grad():
@@ -63,14 +96,15 @@ def exact_self_speculative_generate(model, tokenizer, input_ids, max_new_tokens=
                  max_step_draft=8, th_stop_draft=0.8, auto_th_stop_draft=True, auto_parameters=[1,0.5,0.9,1e-2,0.9],
                  do_sample=False, do_sample_draft=False, top_k=0, top_p=0.85, temperature=0.2):
     
+    device = getattr(model, "device", next(model.parameters()).device)
     step = 0
     step_draft = 0
     step_verify = 0
     
     current_input_ids = input_ids
-    generate_ids = torch.empty([input_ids.size(0), max_new_tokens+max_step_draft], dtype=torch.long, device=model.device)
-    draft_generate_ids = torch.empty([input_ids.size(0), max_step_draft+1], dtype=torch.long, device=model.device)
-    past_key_values = None
+    generate_ids = torch.empty([input_ids.size(0), max_new_tokens+max_step_draft], dtype=torch.long, device=device)
+    draft_generate_ids = torch.empty([input_ids.size(0), max_step_draft+1], dtype=torch.long, device=device)
+    past_key_values = None  # cache disabled
 
     n_matched = 0
     n_drafted = 0
@@ -87,35 +121,35 @@ def exact_self_speculative_generate(model, tokenizer, input_ids, max_new_tokens=
             if step == 0:
                 # first token use full model
                 output = model(input_ids=current_input_ids,
-                        past_key_values=past_key_values,
+                        attention_mask=torch.ones_like(current_input_ids),
+                        past_key_values=None,
                         return_dict=True,
-                        use_cache=True)
+                        use_cache=False)
                 logits = output['logits']
                 logits = logits[:,-1:]
                 output_ids = sample(logits, do_sample=do_sample, top_k=top_k, top_p=top_p, temperature=temperature)
                 generate_ids[:, step] = output_ids
                 current_input_ids = output_ids
-                past_key_values = output['past_key_values']
 
                 step += 1
 
             else:
                 
                 draft_current_input_ids = current_input_ids
-                draft_past_key_values = past_key_values
+                draft_past_key_values = None
                 draft_generate_ids[:, 0] = current_input_ids
                 for step_draft in range(max_step_draft):
                     with model.self_draft():
                         draft_output = model(input_ids=draft_current_input_ids,
-                            past_key_values=draft_past_key_values,
+                            attention_mask=torch.ones_like(draft_current_input_ids),
+                            past_key_values=None,
                             return_dict=True,
-                            use_cache=True)
+                            use_cache=False)
                     draft_probs = draft_output['logits'].softmax(-1)
                     draft_output_ids, draft_output_probs = sample(
                         draft_output['logits'], return_probs=True, do_sample=do_sample_draft, top_k=top_k, top_p=top_p, temperature=temperature)
                     draft_generate_ids[:, step_draft+1] = draft_output_ids
                     draft_current_input_ids = draft_output_ids
-                    draft_past_key_values = draft_output['past_key_values']
 
                     if draft_output_probs.item() < th_stop_draft or step + step_draft + 2 >= max_new_tokens:
                         break
@@ -124,14 +158,13 @@ def exact_self_speculative_generate(model, tokenizer, input_ids, max_new_tokens=
                 drafted_input_ids = draft_generate_ids[:, :drafted_n_tokens+1] # raft input + raft completion
 
                 output = model(input_ids=drafted_input_ids,
-                        past_key_values=past_key_values,
+                        attention_mask=torch.ones_like(drafted_input_ids),
+                        past_key_values=None,
                         return_dict=True,
-                        use_cache=True)
+                        use_cache=False)
                 logits = output['logits']
                 # output_ids = torch.argmax(logits, dim=-1)
                 output_ids = sample(logits, do_sample=do_sample, top_k=top_k, top_p=top_p, temperature=temperature)
-
-                past_key_values = output['past_key_values']
 
                 # including the one generated by the base model
                 max_matched = ((output_ids[:, :-1] != drafted_input_ids[:, 1:]).cumsum(-1) == 0).sum(-1).item() + 1
@@ -139,10 +172,6 @@ def exact_self_speculative_generate(model, tokenizer, input_ids, max_new_tokens=
 
                 if max_of_max_matched != max_matched:
                     output_ids = output_ids[:, :max_matched]
-                    
-                    past_key_values = [
-                        (k[:, :, :-(max_of_max_matched - max_matched)], v[:, :, :-(max_of_max_matched - max_matched)]) for k, v in past_key_values
-                    ]
 
                 generate_ids[:, step:step+output_ids.size(1)] = output_ids
                 current_input_ids = output_ids[:, -1:]
@@ -192,14 +221,15 @@ def self_speculative_sample(model, tokenizer, input_ids, max_new_tokens=10, earl
                  do_sample=False, do_sample_draft=False, 
                  top_k=0, top_p=0.85, temperature=0.2):
     
+    device = getattr(model, "device", next(model.parameters()).device)
     step = 0
     step_draft = 0
     step_verify = 0
     
     current_input_ids = input_ids
-    generate_ids = torch.empty([input_ids.size(0), max_new_tokens+max_step_draft], dtype=torch.long, device=model.device)
-    draft_generate_ids = torch.empty([input_ids.size(0), max_step_draft+2], dtype=torch.long, device=model.device)
-    draft_generate_probs = torch.empty([input_ids.size(0), max_step_draft, model.config.vocab_size], dtype=torch.float, device=model.device)
+    generate_ids = torch.empty([input_ids.size(0), max_new_tokens+max_step_draft], dtype=torch.long, device=device)
+    draft_generate_ids = torch.empty([input_ids.size(0), max_step_draft+2], dtype=torch.long, device=device)
+    draft_generate_probs = torch.empty([input_ids.size(0), max_step_draft, model.config.vocab_size], dtype=torch.float, device=device)
     past_key_values = None
 
     n_matched = 0
@@ -352,7 +382,8 @@ def infer(model, tokenizer, prompt, generate_fn='base',
     if seed is not None:
         torch.manual_seed(seed)
               
-    input_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(model.device)
+    device = getattr(model, "device", next(model.parameters()).device)
+    input_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(device)
     if decode_timing:
         tic = time.time()
     generate_dict = generate_fn(model, tokenizer, input_ids, *args, **kargs)
@@ -398,7 +429,8 @@ def infer_input_ids(model, tokenizer, input_ids, generate_fn='base',
     if seed is not None:
         torch.manual_seed(seed)
         
-    input_ids = input_ids.to(model.device)
+    device = getattr(model, "device", next(model.parameters()).device)
+    input_ids = input_ids.to(device)
     if decode_timing:
         tic = time.time()
     generate_dict = generate_fn(model, tokenizer, input_ids, *args, **kargs)
