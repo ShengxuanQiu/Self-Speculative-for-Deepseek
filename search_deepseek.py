@@ -11,6 +11,9 @@ model_name = "/data/pretrained_models/DeepSeek-V2-Lite-Chat"
 print(f"Loading tokenizer/model from {model_name} ...", flush=True)
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 config = DeepseekV2Config.from_pretrained(model_name)
+# Force routing to top-1 expert for draft model
+config.num_experts_per_tok = 1
+config.topk_method = "greedy"
 # Sanitize rope_scaling if present (convert ints to floats, clamp factor>=1).
 rope_scaling = getattr(config, "rope_scaling", None)
 if isinstance(rope_scaling, dict):
@@ -90,7 +93,7 @@ layer_searching = LayerSkippingSearching(
 
 print("Starting search ...", flush=True)
 # 正式搜索（n_iter 可先小一点试跑）
-layer_searching.search(n_iter=200)
+layer_searching.search(n_iter=80)
 attn_skip, mlp_skip = layer_searching.get_solution()
 print("attn:", attn_skip)
 print("mlp :", mlp_skip)
